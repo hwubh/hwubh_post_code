@@ -1,0 +1,8 @@
+LIBRARY GfxPluginVRSPlugin
+EXPORTS
+    UnityPluginLoad
+    UnityPluginUnload
+    GetRenderEventFunc
+    IsPipelineVRSSupported
+    IsAttachmentVRSSupported
+    GetShadingRateImageTileSize

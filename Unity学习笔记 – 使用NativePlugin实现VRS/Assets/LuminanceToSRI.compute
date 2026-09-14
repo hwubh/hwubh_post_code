@@ -1,0 +1,182 @@
+#pragma kernel ComputeShadingRateWave
+#pragma use_dxc
+#pragma require wavebasic quadshuffle
+
+Texture2D<uint>   _LumGrad;    // 半分辨率亮度图（编码：L | H<<8 | V<<16 | D<<24）
+Texture2D<float2> _MotionVectorTexture;  // 全分辨率 MV（URP 全局 SetGlobalTexture）
+RWTexture2D<uint> _SriOut;     // R8_UInt 源贴图（native 拷贝到 SRI）
+int2  _LumSize;                // 半分辨率尺寸
+int   _TileTexels;             // 每 tile 边长的半分辨率 texel 数 = tileSize/2
+float _Sensitivity;            // JND 灵敏度（Intel 实测 0.25/0.5/0.75）
+float _EnvLuma;                // 环境亮度补偿
+float _K;                      // 1/4 档放宽系数（Yang 2019）
+
+#define INV_255     (1.0 / 255.0)
+#define INV_255_2   (1.0 / 510.0)   // (1/255) * (1/2)，VALAR Eq.2 的 /2 合并
+#define UINT16_MAXF 65535.0
+
+// VALAR 官方 SLM 模式：4 个标量 uint，InterlockedAdd 原子累加
+groupshared uint slmLumaSum;
+groupshared uint slmLumaSumX;
+groupshared uint slmLumaSumY;
+groupshared uint slmVelocityMin;
+
+// 单 texel 贡献——整数域解码 + int 差分（避免 unsigned 回绕），最后统一缩放
+// 越界访问返回 0（D3D12 规范保证），边缘 tile 略微保守，与 VALAR 行为一致
+void TexelContribution(int2 texelPos, out float luma, out float errX, out float errY)
+{
+    uint e = _LumGrad[texelPos];
+
+    int l = (int)(e & 0xFF);
+    int h = (int)((e >> 8) & 0xFF);
+    int v = (int)((e >> 16) & 0xFF);
+
+    errX = (float)abs(h - l);
+    errY = (float)abs(v - l);
+    errX = max(errX, (float)abs(l - (int)(_LumGrad[texelPos + int2(1, 0)] & 0xFF)));
+    errY = max(errY, (float)abs(l - (int)(_LumGrad[texelPos + int2(0, 1)] & 0xFF)));
+
+    luma = l * INV_255;
+    errX *= INV_255_2;
+    errY *= INV_255_2;
+}
+
+// VALAR 速度误差修正（Yang 2019 论文 Eq.20/21）
+float ComputeHalfRateVelocityError(float v)
+{
+    return pow(1.0 / (1.0 + pow(1.05 * v, 3.10)), 0.35);
+}
+
+float ComputeQuarterRateVelocityError(float v)
+{
+    return _K * pow(1.0 / (1.0 + pow(0.55 * v, 2.41)), 0.49);
+}
+
+// 一线程组 = 一个 tile（8x8 = 64 线程，匹配 NVIDIA tileSize=16 → _TileTexels=8）
+// Dispatch(sriW, sriH, 1)：组数 = tile 数 = SRI texel 数
+// groupThreadId.xy 直接 = tile 内 2D texel 偏移，无需 groupIndex 拆分
+[numthreads(8, 8, 1)]
+void ComputeShadingRateWave(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, uint groupIndex : SV_GroupIndex)
+{
+    uint sriWidth, sriHeight;
+    _SriOut.GetDimensions(sriWidth, sriHeight);
+    uint texels = (uint)(_TileTexels * _TileTexels);
+
+    // ===== Stage 1: Initialize SLM Accumulators — GI=0 (Blue) =====
+    if (groupIndex == 0)
+    {
+        slmLumaSum = 0;
+        slmLumaSumX = 0;
+        slmLumaSumY = 0;
+        slmVelocityMin = 0xFFFFFFFFu;
+    }
+
+    // ===== Barrier 1 (Red) — 保证 SLM 初始化可见后再做 InterlockedAdd =====
+    GroupMemoryBarrierWithGroupSync();
+
+    // ===== Stage 2: Compute X/Y Luminance Differences (WaveActiveSum) — Parallel (Green) =====
+
+    // tile 级重投影：MV 把采样位置偏回帧 N-1
+    int2 tileCenterPixel = (int2)groupId.xy * _TileTexels * 2 + _TileTexels;
+    uint mvW, mvH;
+    _MotionVectorTexture.GetDimensions(mvW, mvH);
+    tileCenterPixel = clamp(tileCenterPixel, int2(0, 0), int2((int)mvW - 1, (int)mvH - 1));
+    float2 motionVector = _MotionVectorTexture.Load(int3(tileCenterPixel, 0)).rg;
+    int2 tileOffset = int2(round(motionVector * float2(sriWidth, sriHeight)));
+    int2 tileReprojected = clamp(groupId.xy - tileOffset, int2(0, 0), int2(sriWidth, sriHeight) - 1);
+
+    // groupThreadId.xy 直接 = tile 内 texel 偏移（8x8 匹配 _TileTexels=8）
+    // _TileTexels < 8 时越界线程贡献 0（TexelContribution 内部检查 _LumSize 兜底）
+    int2 texelPos = tileReprojected * _TileTexels + (int2)groupThreadId.xy;
+
+    float luma = 0, errX = 0, errY = 0;
+    if (groupThreadId.x < _TileTexels && groupThreadId.y < _TileTexels)
+        TexelContribution(texelPos, luma, errX, errY);
+
+    // WaveActiveSum：波内 butterfly shuffle，结果广播到全波
+    float localWaveLumaSum = WaveActiveSum(luma);
+    float localWaveLumaSumX = WaveActiveSum(errX);
+    float localWaveLumaSumY = WaveActiveSum(errY);
+
+    // ===== Stage 3: Compute Minimum Tile Velocity — Parallel (Gray) =====
+    int2 quadBase = int2(groupId.xy * (_TileTexels * 2)) + int2(groupThreadId.xy * 2);
+
+    float quadMinVelocity = 3.402823466e+38;
+    [unroll]
+    for (int dy = 0; dy < 2; ++dy)
+    {
+        [unroll]
+        for (int dx = 0; dx < 2; ++dx)
+        {
+            int2 mvPixel = clamp(quadBase + int2(dx, dy),
+                                int2(0, 0),
+                                int2((int)mvW - 1, (int)mvH - 1));
+            float2 mv = _MotionVectorTexture.Load(int3(mvPixel, 0)).rg;
+            quadMinVelocity = min(quadMinVelocity, length(mv * float2(mvW, mvH)));
+        }
+    }
+
+    float localWaveVelocityMin = WaveActiveMin(quadMinVelocity);
+
+    // ===== Barrier 2 (Red) — 保证 WaveActiveSum 完成后再做 InterlockedAdd =====
+    GroupMemoryBarrierWithGroupSync();
+
+    // ===== Stage 4: Average X/Y Luminance (SLM + Atomic) — First Wave Lane (Purple) =====
+    if (WaveIsFirstLane())
+    {
+        InterlockedAdd(slmLumaSum, (uint)(localWaveLumaSum * UINT16_MAXF));
+        InterlockedAdd(slmLumaSumX, (uint)(localWaveLumaSumX * UINT16_MAXF));
+        InterlockedAdd(slmLumaSumY, (uint)(localWaveLumaSumY * UINT16_MAXF));
+        InterlockedMin(slmVelocityMin, (uint)(localWaveVelocityMin * UINT16_MAXF));
+    }
+
+    // ===== Barrier 3 (Red) — 保证所有波写入完成后再读 =====
+    GroupMemoryBarrierWithGroupSync();
+
+    // ===== Stage 5+6+7: JND Threshold + Compute Rate + Write — GI=0 (Blue) =====
+    if (groupIndex == 0)
+    {
+        float totalTileLuma  = slmLumaSum / UINT16_MAXF;
+        float totalTileLumaX = slmLumaSumX / UINT16_MAXF;
+        float totalTileLumaY = slmLumaSumY / UINT16_MAXF;
+        float minTileVelocity = slmVelocityMin / UINT16_MAXF;
+
+        float avgTileLuma = totalTileLuma / texels;
+        float avgErrorX = sqrt(totalTileLumaX / texels);
+        float avgErrorY = sqrt(totalTileLumaY / texels);
+
+
+        // Stage 5: JND = Sensitivity * (avgLuma + EnvLuma) — Weber 定律
+        float jnd_threshold = _Sensitivity * (avgTileLuma + _EnvLuma);
+
+        // Stage 6: 速度修正 + X/Y 轴独立三档判决（VALAR Eq.16/14）
+        float velocityHError = ComputeHalfRateVelocityError(minTileVelocity);
+        float velocityQError = ComputeQuarterRateVelocityError(minTileVelocity);
+
+        uint xRate = 1; // 默认 2X
+        uint yRate = 1;
+
+        if ((velocityHError * avgErrorX) >= jnd_threshold)
+        {
+            xRate = 0; // 1X
+        }
+        else if ((velocityQError * avgErrorX) < jnd_threshold)
+        {
+            xRate = 2; // 4X
+        }
+
+        if ((velocityHError * avgErrorY) >= jnd_threshold)
+        {
+            // 防止 4x1（非法）：xRate=4X 时 yRate 强制 2X
+            yRate = (xRate == 2) ? 1 : 0;
+        }
+        else if ((velocityQError * avgErrorY) < jnd_threshold)
+        {
+            // 防止 4x4 和 1x4：xRate=1X 时 yRate 强制 2X
+            yRate = (xRate == 0) ? 1 : 2;
+        }
+
+        // Stage 7: 写入 SRI（位编码 xRate<<2 | yRate）
+        _SriOut[groupId.xy] = (xRate << 2) | yRate;
+    }
+}
